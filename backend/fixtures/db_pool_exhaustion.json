@@ -1,0 +1,131 @@
+{
+  "id": "inc-db-pool-exhaustion",
+  "title": "PostgreSQL Connection Pool Exhaustion on Payments Service",
+  "summary": "Sudden saturation of primary database connection pool following bulk invoice sync rollout, resulting in cascading 504 Gateway Timeouts across checkout flows.",
+  "severity": "P0",
+  "status": "mitigated",
+  "service": "payments-api",
+  "environment": "production",
+  "started_at": "2026-09-18T14:08:12Z",
+  "detected_at": "2026-09-18T14:12:45Z",
+  "mitigated_at": "2026-09-18T14:48:00Z",
+  "sources_connected": ["github", "sentry", "logs", "metrics", "deployment"],
+  "blast_radius": {
+    "services_impacted": ["payments-api", "checkout-web", "subscription-worker", "analytics-sync"],
+    "users_affected_count": 8420,
+    "error_rate_peak_pct": 46.2,
+    "p99_latency_ms": 32500,
+    "regions_affected": ["us-east-1", "us-east-2"]
+  },
+  "evidence_count": 6,
+  "primary_hypothesis": "PR #412 introduced un-scoped database transactions during bulk invoice queries, omitting connection pool release in error handlers.",
+  "timeline_summary": "At 14:08 UTC, automated deployment v2.14.2 rolled out commit b91c4a0. By 14:12, RDS Postgres active pool connections jumped from normal baseline of 22 to max limit 100. Sentry started capturing DBConnectionTimeout errors at 14:13, triggering automated P0 pager. Traffic was mitigated at 14:48 by reverting commit and restarting pods.",
+  "key_anomalies": [
+    "Database pool queue depth spiked from 0 to 1,480 within 90 seconds",
+    "P99 latency surged from 42ms to 32.5s",
+    "Missing connection.release() found in bulk_sync_invoices worker routine"
+  ],
+  "suggested_action_items": [
+    "Revert PR #412 and patch connection context manager with explicit finally block",
+    "Increase HikariCP/AsyncPG pool max lifetime timeout alarm threshold",
+    "Add integration test verifying connection release under simulated downstream timeout"
+  ],
+  "evidence_events": [
+    {
+      "id": "evt-gh-412",
+      "source": "github",
+      "timestamp": "2026-09-18T14:02:19Z",
+      "title": "PR #412 Merged: 'refactor(billing): add bulk invoice synchronization'",
+      "summary": "Merged by @alex-dev into main. 12 files changed, +384 -92 lines. Introduces batch query for quarterly invoices.",
+      "severity": "info",
+      "is_root_cause_candidate": true,
+      "metadata": {
+        "commit_hash": "b91c4a0f8",
+        "author": "alex-dev",
+        "pr_number": 412,
+        "repo": "acme-corp/payments-service",
+        "diff_snippet": "+ async with db.transaction():\n+   results = await db.fetch_all(query)\n+   # NOTE: missing finally block for connection lease"
+      },
+      "correlated_event_ids": ["evt-dep-2142", "evt-met-conn-spike"]
+    },
+    {
+      "id": "evt-dep-2142",
+      "source": "deployment",
+      "timestamp": "2026-09-18T14:08:12Z",
+      "title": "Canary & Full Rollout: payments-api v2.14.2",
+      "summary": "Kubernetes deployment rollout succeeded on cluster prod-useast1-k8s across 24 replica pods.",
+      "severity": "info",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "release": "v2.14.2",
+        "cluster": "prod-useast1-k8s",
+        "replicas": 24,
+        "strategy": "RollingUpdate"
+      },
+      "correlated_event_ids": ["evt-gh-412", "evt-met-conn-spike"]
+    },
+    {
+      "id": "evt-met-conn-spike",
+      "source": "metrics",
+      "timestamp": "2026-09-18T14:12:05Z",
+      "title": "CloudWatch Metric Alert: RDS Connection Pool Saturated (100%)",
+      "summary": "Postgres Primary pool exhausted. Active connections 100/100. Wait queue exceeded 1,200 requests.",
+      "severity": "critical",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "metric_name": "DatabaseConnections",
+        "threshold": 90,
+        "observed_value": 100,
+        "host": "aurora-pg-primary.internal"
+      },
+      "correlated_event_ids": ["evt-dep-2142", "evt-sen-timeout", "evt-log-504"]
+    },
+    {
+      "id": "evt-sen-timeout",
+      "source": "sentry",
+      "timestamp": "2026-09-18T14:13:30Z",
+      "title": "Sentry Issue #8921: DBConnectionTimeoutException",
+      "summary": "PoolAcquisitionTimeout: Timed out waiting 30000ms for connection from pool 'aurora-primary-rw'. 4,210 events in 10 minutes.",
+      "severity": "error",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "issue_id": "PAYMENTS-8921",
+        "exception_type": "asyncpg.exceptions.PoolTimeoutError",
+        "culprit": "services/billing/invoicing.py in bulk_sync_invoices at line 148",
+        "stack_trace": "File 'services/billing/invoicing.py', line 148, in bulk_sync_invoices\n    conn = await pool.acquire(timeout=30.0)\nFile 'asyncpg/pool.py', line 542, in acquire\n    raise asyncio.TimeoutError('Connection pool exhausted')"
+      },
+      "correlated_event_ids": ["evt-met-conn-spike", "evt-log-504"]
+    },
+    {
+      "id": "evt-log-504",
+      "source": "logs",
+      "timestamp": "2026-09-18T14:14:10Z",
+      "title": "Nginx Ingress Error Spike: 504 Gateway Timeout",
+      "summary": "Ingress upstream request timeout for endpoint POST /v1/checkout/charge. Upstream server unresponsive for 60s.",
+      "severity": "error",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "status_code": 504,
+        "endpoint": "/v1/checkout/charge",
+        "rate_per_sec": 380,
+        "sample_log": "2026-09-18T14:14:10.892Z [error] 14#14: *120485 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 198.51.100.44, server: api.acme.com, request: 'POST /v1/checkout/charge HTTP/2.0'"
+      },
+      "correlated_event_ids": ["evt-sen-timeout"]
+    },
+    {
+      "id": "evt-gh-revert",
+      "source": "github",
+      "timestamp": "2026-09-18T14:42:00Z",
+      "title": "PR #415 Merged: 'Revert PR #412 and patch pool lifecycle'",
+      "summary": "Emergency hotfix PR merged by on-call lead. Rolled back v2.14.2 to v2.14.1 on prod.",
+      "severity": "info",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "pr_number": 415,
+        "author": "sre-oncall",
+        "status": "deployed"
+      },
+      "correlated_event_ids": ["evt-gh-412"]
+    }
+  ]
+}

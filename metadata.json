@@ -1,0 +1,6 @@
+{
+  "name": "BlackBox",
+  "description": "AI Incident Investigator for software systems. Correlate engineering evidence across GitHub, Sentry, and system logs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

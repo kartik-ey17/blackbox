@@ -1,0 +1,115 @@
+{
+  "id": "inc-mem-leak-k8s",
+  "title": "Kubernetes OOMKilled Pod Cascades in Search & Recommender",
+  "summary": "Gradual unevicted vector embedding cache expansion leading to repetitive node memory pressure, cgroup OOMKills, and 502 Bad Gateway cascading outages.",
+  "severity": "P1",
+  "status": "investigating",
+  "service": "recommendation-engine",
+  "environment": "production",
+  "started_at": "2026-09-18T09:15:00Z",
+  "detected_at": "2026-09-18T11:42:18Z",
+  "mitigated_at": null,
+  "sources_connected": ["github", "sentry", "logs", "metrics", "deployment"],
+  "blast_radius": {
+    "services_impacted": ["recommendation-engine", "search-gateway", "home-feed-bff"],
+    "users_affected_count": 14200,
+    "error_rate_peak_pct": 28.4,
+    "p99_latency_ms": 14800,
+    "regions_affected": ["eu-central-1"]
+  },
+  "evidence_count": 5,
+  "primary_hypothesis": "Commit 4a8e291 initialized an unbounded Python in-memory LRU dict for semantic embeddings without maxsize limit or TTL eviction policy.",
+  "timeline_summary": "At 09:15 UTC, release v3.8.0 was deployed to cluster prod-eucentral-k8s. Over the next 2.5 hours, pod resident memory climbed from 512MB to 4.0GB cgroup limit. At 11:41, Linux kernel sent SIGKILL (exit code 137). Restarting pods caused cold-cache thrashing and degraded response times.",
+  "key_anomalies": [
+    "Process RSS memory growth rate was perfectly linear (+22MB/minute)",
+    "7 out of 8 pods were terminated by Kubelet OOMKilled simultaneously",
+    "JVM/Python garbage collector spend reached 68% of CPU cycles prior to termination"
+  ],
+  "suggested_action_items": [
+    "Hotfix cache configuration to enforce maxsize=10000 with redis offload",
+    "Temporarily increase pod memory limits from 4Gi to 8Gi to prevent flapping",
+    "Configure Prometheus cgroup memory slope alerting (alert on >10% growth/hr)"
+  ],
+  "evidence_events": [
+    {
+      "id": "evt-gh-mem-pr",
+      "source": "github",
+      "timestamp": "2026-09-18T09:02:11Z",
+      "title": "PR #889 Merged: 'feat(search): in-memory cache for user vector embeddings'",
+      "summary": "Merged by @ml-eng. Added local dictionary cache to bypass vector DB latency for frequent shoppers.",
+      "severity": "info",
+      "is_root_cause_candidate": true,
+      "metadata": {
+        "commit_hash": "4a8e291f0",
+        "author": "ml-eng",
+        "pr_number": 889,
+        "repo": "acme-corp/recommendation-engine",
+        "diff_snippet": "+ _EMBEDDING_CACHE = {} # Global cache without TTL\n+ def get_cached_vector(user_id):\n+   if user_id not in _EMBEDDING_CACHE:\n+     _EMBEDDING_CACHE[user_id] = model.encode(user_id)"
+      },
+      "correlated_event_ids": ["evt-dep-mem", "evt-met-rss-ramp"]
+    },
+    {
+      "id": "evt-dep-mem",
+      "source": "deployment",
+      "timestamp": "2026-09-18T09:15:00Z",
+      "title": "Deployment rollout: recommendation-engine v3.8.0",
+      "summary": "ArgoCD synced deployment recommendation-engine to tag v3.8.0 in namespace 'ml-serving'.",
+      "severity": "info",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "tag": "v3.8.0",
+        "tool": "ArgoCD",
+        "namespace": "ml-serving"
+      },
+      "correlated_event_ids": ["evt-gh-mem-pr", "evt-met-rss-ramp"]
+    },
+    {
+      "id": "evt-met-rss-ramp",
+      "source": "metrics",
+      "timestamp": "2026-09-18T10:45:00Z",
+      "title": "Prometheus Anomaly: container_memory_working_set_bytes Breach",
+      "summary": "Memory consumption exceeded 85% warning watermark on 8 out of 8 replica pods.",
+      "severity": "warning",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "metric": "container_memory_working_set_bytes",
+        "current_value": "3.62GiB",
+        "limit": "4.00GiB",
+        "rate_of_change": "+1.3GB/hr"
+      },
+      "correlated_event_ids": ["evt-dep-mem", "evt-log-oomkill"]
+    },
+    {
+      "id": "evt-log-oomkill",
+      "source": "logs",
+      "timestamp": "2026-09-18T11:41:22Z",
+      "title": "Kubernetes Kubelet Event: Pod OOMKilled (Exit Code 137)",
+      "summary": "Kernel invocation: cgroup out of memory: Killed process 38194 (gunicorn worker) total-vm:4289100kB, anon-rss:3992140kB.",
+      "severity": "critical",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "pod_name": "recommendation-engine-67d9bc46f-8k9pl",
+        "exit_code": 137,
+        "reason": "OOMKilled",
+        "raw_event": "Memory cgroup out of memory: Kill process 38194 (python3) score 982 or sacrifice child"
+      },
+      "correlated_event_ids": ["evt-met-rss-ramp", "evt-sen-sigkill"]
+    },
+    {
+      "id": "evt-sen-sigkill",
+      "source": "sentry",
+      "timestamp": "2026-09-18T11:42:18Z",
+      "title": "Sentry Issue #9402: WorkerLostRemoteError",
+      "summary": "Process terminated abnormally while handling batch inference request. 1,840 user requests dropped.",
+      "severity": "error",
+      "is_root_cause_candidate": false,
+      "metadata": {
+        "issue_id": "REC-9402",
+        "culprit": "gunicorn.arbiter in handle_child_termination",
+        "error_class": "WorkerLostRemoteError",
+        "handled": false
+      },
+      "correlated_event_ids": ["evt-log-oomkill"]
+    }
+  ]
+}
